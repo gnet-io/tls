@@ -1,246 +1,355 @@
-package gnettls
+// Copyright 2009 The Go Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
+// Package tls partially implements TLS 1.2, as specified in RFC 5246,
+// and TLS 1.3, as specified in RFC 8446.
+package tls
+
+// BUG(agl): The crypto/tls package only implements some countermeasures
+// against Lucky13 attacks on CBC-mode encryption, and only on SHA1
+// variants. See http://www.isg.rhul.ac.uk/tls/TLStiming.pdf and
+// https://www.imperialviolet.org/2013/02/04/luckythirteen.html.
 
 import (
 	"bytes"
+	"crypto"
+	"crypto/ecdsa"
+	"crypto/ed25519"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
-	"io"
+	"fmt"
 	"net"
-	"runtime/debug"
-	"time"
-
-	"github.com/gnet-io/tls/tls"
-	"github.com/panjf2000/gnet/v2"
-	"github.com/panjf2000/gnet/v2/pkg/logging"
-	bbPool "github.com/panjf2000/gnet/v2/pkg/pool/bytebuffer"
+	"os"
+	"strings"
 )
 
-type tlsConn struct {
-	raw           gnet.Conn
-	rawTLSConn    *tls.Conn
-	inboundBuffer *bytes.Buffer
-	ctx           interface{}
-}
-
-func (c *tlsConn) Read(p []byte) (n int, err error) {
-	return c.inboundBuffer.Read(p)
-}
-
-func (c *tlsConn) WriteTo(w io.Writer) (n int64, err error) {
-	return c.inboundBuffer.WriteTo(w)
-}
-
-func (c *tlsConn) Next(n int) (buf []byte, err error) {
-	if n < 0 || n > c.inboundBuffer.Len() {
-		n = c.inboundBuffer.Len()
+// Server returns a new TLS server side connection
+// using conn as the underlying transport.
+// The configuration config must be non-nil and must include
+// at least one certificate or else set GetCertificate.
+func Server(conn net.Conn, config *Config) *Conn {
+	c := &Conn{
+		conn:   conn,
+		config: config,
 	}
-	return c.inboundBuffer.Next(n), nil
+	c.handshakeFn = c.serverHandshake
+	return c
 }
 
-func (c *tlsConn) Peek(n int) (buf []byte, err error) {
-	if c.inboundBuffer.Len() < n {
-		return nil, io.ErrShortBuffer
+// Client returns a new TLS client side connection
+// using conn as the underlying transport.
+// The config cannot be nil: users must set either ServerName or
+// InsecureSkipVerify in the config.
+func Client(conn net.Conn, config *Config) *Conn {
+	c := &Conn{
+		conn:     conn,
+		config:   config,
+		isClient: true,
 	}
-	return c.inboundBuffer.Bytes()[:n], nil
+	c.handshakeFn = c.clientHandshake
+	return c
 }
 
-func (c *tlsConn) Discard(n int) (discarded int, err error) {
-	r, err := io.CopyN(io.Discard, c.inboundBuffer, int64(n))
-	return int(r), err
+// A listener implements a network listener (net.Listener) for TLS connections.
+type listener struct {
+	net.Listener
+	config *Config
 }
 
-func (c *tlsConn) InboundBuffered() (n int) {
-	return c.inboundBuffer.Len()
-}
-
-func (c *tlsConn) Write(p []byte) (n int, err error) {
-	return c.rawTLSConn.Write(p)
-}
-
-func (c *tlsConn) ReadFrom(r io.Reader) (n int64, err error) {
-	return c.inboundBuffer.ReadFrom(r)
-}
-
-func (c *tlsConn) Writev(bs [][]byte) (n int, err error) {
-	bb := bbPool.Get()
-	defer bbPool.Put(bb)
-	for i := range bs {
-		_, _ = bb.Write(bs[i])
+// Accept waits for and returns the next incoming TLS connection.
+// The returned connection is of type *Conn.
+func (l *listener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
 	}
-	return c.Write(bb.Bytes())
+	return Server(c, l.config), nil
 }
 
-func (c *tlsConn) Flush() (err error) {
-	return c.raw.Flush()
+// NewListener creates a Listener which accepts connections from an inner
+// Listener and wraps each connection with [Server].
+// The configuration config must be non-nil and must include
+// at least one certificate or else set GetCertificate.
+func NewListener(inner net.Listener, config *Config) net.Listener {
+	l := new(listener)
+	l.Listener = inner
+	l.config = config
+	return l
 }
 
-func (c *tlsConn) OutboundBuffered() (n int) {
-	return c.raw.OutboundBuffered()
+// Listen creates a TLS listener accepting connections on the
+// given network address using net.Listen.
+// The configuration config must be non-nil and must include
+// at least one certificate or else set GetCertificate.
+func Listen(network, laddr string, config *Config) (net.Listener, error) {
+	if config == nil || len(config.Certificates) == 0 &&
+		config.GetCertificate == nil && config.GetConfigForClient == nil {
+		return nil, errors.New("tls: neither Certificates, GetCertificate, nor GetConfigForClient set in Config")
+	}
+	l, err := net.Listen(network, laddr)
+	if err != nil {
+		return nil, err
+	}
+	return NewListener(l, config), nil
 }
 
-func (c *tlsConn) AsyncWrite(buf []byte, callback gnet.AsyncCallback) (err error) {
-	_, err = c.Write(buf)
-	return callback(c, err)
+type timeoutError struct{}
+
+func (timeoutError) Error() string   { return "tls: DialWithDialer timed out" }
+func (timeoutError) Timeout() bool   { return true }
+func (timeoutError) Temporary() bool { return true }
+
+// DialWithDialer connects to the given network address using dialer.Dial and
+// then initiates a TLS handshake, returning the resulting TLS connection. Any
+// timeout or deadline given in the dialer apply to connection and TLS
+// handshake as a whole.
+//
+// DialWithDialer interprets a nil configuration as equivalent to the zero
+// configuration; see the documentation of [Config] for the defaults.
+//
+// DialWithDialer uses context.Background internally; to specify the context,
+// use [Dialer.DialContext] with NetDialer set to the desired dialer.
+//func DialWithDialer(dialer *net.Dialer, network, addr string, config *Config) (*Conn, error) {
+//	return dial(context.Background(), dialer, network, addr, config)
+//}
+//
+//func dial(ctx context.Context, netDialer *net.Dialer, network, addr string, config *Config) (*Conn, error) {
+//	if netDialer.Timeout != 0 {
+//		var cancel context.CancelFunc
+//		ctx, cancel = context.WithTimeout(ctx, netDialer.Timeout)
+//		defer cancel()
+//	}
+//
+//	if !netDialer.Deadline.IsZero() {
+//		var cancel context.CancelFunc
+//		ctx, cancel = context.WithDeadline(ctx, netDialer.Deadline)
+//		defer cancel()
+//	}
+//
+//	rawConn, err := netDialer.DialContext(ctx, network, addr)
+//	if err != nil {
+//		return nil, err
+//	}
+//
+//	colonPos := strings.LastIndex(addr, ":")
+//	if colonPos == -1 {
+//		colonPos = len(addr)
+//	}
+//	hostname := addr[:colonPos]
+//
+//	if config == nil {
+//		config = defaultConfig()
+//	}
+//	// If no ServerName is set, infer the ServerName
+//	// from the hostname we're connecting to.
+//	if config.ServerName == "" {
+//		// Make a copy to avoid polluting argument or default.
+//		c := config.Clone()
+//		c.ServerName = hostname
+//		config = c
+//	}
+//
+//	conn := Client(rawConn, config)
+//	if err := conn.HandshakeContext(ctx); err != nil {
+//		rawConn.Close()
+//		return nil, err
+//	}
+//	return conn, nil
+//}
+//
+//// Dial connects to the given network address using net.Dial
+//// and then initiates a TLS handshake, returning the resulting
+//// TLS connection.
+//// Dial interprets a nil configuration as equivalent to
+//// the zero configuration; see the documentation of Config
+//// for the defaults.
+//func Dial(network, addr string, config *Config) (*Conn, error) {
+//	return DialWithDialer(new(net.Dialer), network, addr, config)
+//}
+//
+//// Dialer dials TLS connections given a configuration and a Dialer for the
+//// underlying connection.
+//type Dialer struct {
+//	// NetDialer is the optional dialer to use for the TLS connections'
+//	// underlying TCP connections.
+//	// A nil NetDialer is equivalent to the net.Dialer zero value.
+//	NetDialer *net.Dialer
+//
+//	// Config is the TLS configuration to use for new connections.
+//	// A nil configuration is equivalent to the zero
+//	// configuration; see the documentation of Config for the
+//	// defaults.
+//	Config *Config
+//}
+//
+//// Dial connects to the given network address and initiates a TLS
+//// handshake, returning the resulting TLS connection.
+////
+//// The returned [Conn], if any, will always be of type *[Conn].
+////
+//// Dial uses context.Background internally; to specify the context,
+//// use [Dialer.DialContext].
+//func (d *Dialer) Dial(network, addr string) (net.Conn, error) {
+//	return d.DialContext(context.Background(), network, addr)
+//}
+//
+//func (d *Dialer) netDialer() *net.Dialer {
+//	if d.NetDialer != nil {
+//		return d.NetDialer
+//	}
+//	return new(net.Dialer)
+//}
+//
+//// DialContext connects to the given network address and initiates a TLS
+//// handshake, returning the resulting TLS connection.
+////
+//// The provided Context must be non-nil. If the context expires before
+//// the connection is complete, an error is returned. Once successfully
+//// connected, any expiration of the context will not affect the
+//// connection.
+////
+//// The returned [Conn], if any, will always be of type *[Conn].
+//func (d *Dialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+//	c, err := dial(ctx, d.netDialer(), network, addr, d.Config)
+//	if err != nil {
+//		// Don't return c (a typed nil) in an interface.
+//		return nil, err
+//	}
+//	return c, nil
+//}
+
+// LoadX509KeyPair reads and parses a public/private key pair from a pair
+// of files. The files must contain PEM encoded data. The certificate file
+// may contain intermediate certificates following the leaf certificate to
+// form a certificate chain. On successful return, Certificate.Leaf will
+// be nil because the parsed form of the certificate is not retained.
+func LoadX509KeyPair(certFile, keyFile string) (Certificate, error) {
+	certPEMBlock, err := os.ReadFile(certFile)
+	if err != nil {
+		return Certificate{}, err
+	}
+	keyPEMBlock, err := os.ReadFile(keyFile)
+	if err != nil {
+		return Certificate{}, err
+	}
+	return X509KeyPair(certPEMBlock, keyPEMBlock)
 }
 
-func (c *tlsConn) AsyncWritev(bs [][]byte, callback gnet.AsyncCallback) (err error) {
-	_, err = c.Writev(bs)
-	return callback(c, err)
-}
+// X509KeyPair parses a public/private key pair from a pair of
+// PEM encoded data. On successful return, Certificate.Leaf will be nil because
+// the parsed form of the certificate is not retained.
+func X509KeyPair(certPEMBlock, keyPEMBlock []byte) (Certificate, error) {
+	fail := func(err error) (Certificate, error) { return Certificate{}, err }
 
-func (c *tlsConn) Fd() int {
-	return c.raw.Fd()
-}
-
-func (c *tlsConn) Dup() (int, error) {
-	return c.raw.Dup()
-}
-
-func (c *tlsConn) SetReadBuffer(bytes int) error {
-	return c.raw.SetReadBuffer(bytes)
-}
-
-func (c *tlsConn) SetWriteBuffer(bytes int) error {
-	return c.raw.SetWriteBuffer(bytes)
-}
-
-func (c *tlsConn) SetLinger(sec int) error {
-	return c.raw.SetLinger(sec)
-}
-
-func (c *tlsConn) SetKeepAlivePeriod(d time.Duration) error {
-	return c.raw.SetKeepAlivePeriod(d)
-}
-
-func (c *tlsConn) SetNoDelay(noDelay bool) error {
-	return c.raw.SetNoDelay(noDelay)
-}
-
-func (c *tlsConn) Context() (ctx interface{}) {
-	return c.ctx
-}
-
-func (c *tlsConn) SetContext(ctx interface{}) {
-	c.ctx = ctx
-}
-
-func (c *tlsConn) LocalAddr() (addr net.Addr) {
-	return c.raw.LocalAddr()
-}
-
-func (c *tlsConn) RemoteAddr() (addr net.Addr) {
-	return c.raw.RemoteAddr()
-}
-
-func (c *tlsConn) Wake(callback gnet.AsyncCallback) (err error) {
-	return c.raw.Wake(callback)
-}
-
-func (c *tlsConn) CloseWithCallback(callback gnet.AsyncCallback) (err error) {
-	return c.raw.CloseWithCallback(callback)
-}
-
-func (c *tlsConn) Close() (err error) {
-	return c.raw.Close()
-}
-
-func (c *tlsConn) SetDeadline(t time.Time) (err error) {
-	return c.raw.SetDeadline(t)
-}
-
-func (c *tlsConn) SetReadDeadline(t time.Time) (err error) {
-	return c.raw.SetReadDeadline(t)
-}
-
-func (c *tlsConn) SetWriteDeadline(t time.Time) (err error) {
-	return c.SetWriteDeadline(t)
-}
-
-type tlsEventHandler struct {
-	gnet.EventHandler
-	tlsConfig *tls.Config
-}
-
-func (h *tlsEventHandler) OnOpen(c gnet.Conn) (out []byte, action gnet.Action) {
-	// upgrade gnet.Conn to TLSConn
-	tc := tls.Server(c, h.tlsConfig)
-	c.SetContext(&tlsConn{
-		raw:           c,
-		rawTLSConn:    tc,
-		inboundBuffer: bytes.NewBuffer(make([]byte, 0, 512)),
-	})
-	// The code here does not need call OnOpen now; it can be deferred until the handshake complete
-	return
-}
-
-func (h *tlsEventHandler) OnTraffic(c gnet.Conn) (action gnet.Action) {
-	tc := c.Context().(*tlsConn)
-
-	// TLS handshake
-	buffered := tc.raw.InboundBuffered()
-	noReadCount := 0
-	for !tc.rawTLSConn.HandshakeCompleted() && tc.raw.InboundBuffered() > 0 {
-		if noReadCount >= 10 {
-			logging.Errorf("max retry handshake inbound buffered: %d", tc.raw.InboundBuffered())
-			return gnet.Close
-		}
-		err := tc.rawTLSConn.Handshake()
-		// no data is read
-		if buffered == tc.raw.InboundBuffered() {
-			noReadCount++
-		} else {
-			noReadCount = 0
-		}
-
-		buffered = tc.raw.InboundBuffered()
-
-		// data not enough wait for next round
-		if errors.Is(err, tls.ErrNotEnough) {
-			return gnet.None
-		}
-
-		if err != nil {
-			logging.Error(err)
-			return gnet.Close
-		}
-
-		// handshake completed to fire OnOpen
-		if tc.rawTLSConn.HandshakeCompleted() {
-			// fire OnOpen when handshake completed
-			out, act := h.EventHandler.OnOpen(tc)
-			if act != gnet.None {
-				return act
-			}
-			if len(out) > 0 {
-				if _, err := tc.Write(out); err != nil {
-					return gnet.Close
-				}
-			}
+	var cert Certificate
+	var skippedBlockTypes []string
+	for {
+		var certDERBlock *pem.Block
+		certDERBlock, certPEMBlock = pem.Decode(certPEMBlock)
+		if certDERBlock == nil {
 			break
 		}
-	}
-
-	if !tc.rawTLSConn.HandshakeCompleted() {
-		return gnet.None
-	}
-
-	bb := bbPool.Get()
-	defer bbPool.Put(bb)
-	n, err := bb.ReadFrom(tc.rawTLSConn)
-	if err != nil {
-		// close when the error is not ErrNotEnough or EOF
-		if !(errors.Is(err, io.EOF) || errors.Is(err, tls.ErrNotEnough)) {
-			logging.Errorf("tls conn OnTraffic err: %v, stack: %s", err, debug.Stack())
-			return gnet.Close
+		if certDERBlock.Type == "CERTIFICATE" {
+			cert.Certificate = append(cert.Certificate, certDERBlock.Bytes)
+		} else {
+			skippedBlockTypes = append(skippedBlockTypes, certDERBlock.Type)
 		}
 	}
 
-	if n > 0 {
-		tc.inboundBuffer.Write(bb.Bytes())
+	if len(cert.Certificate) == 0 {
+		if len(skippedBlockTypes) == 0 {
+			return fail(errors.New("tls: failed to find any PEM data in certificate input"))
+		}
+		if len(skippedBlockTypes) == 1 && strings.HasSuffix(skippedBlockTypes[0], "PRIVATE KEY") {
+			return fail(errors.New("tls: failed to find certificate PEM data in certificate input, but did find a private key; PEM inputs may have been switched"))
+		}
+		return fail(fmt.Errorf("tls: failed to find \"CERTIFICATE\" PEM block in certificate input after skipping PEM blocks of the following types: %v", skippedBlockTypes))
 	}
 
-	if tc.inboundBuffer.Len() > 0 {
-		return h.EventHandler.OnTraffic(tc)
+	skippedBlockTypes = skippedBlockTypes[:0]
+	var keyDERBlock *pem.Block
+	for {
+		keyDERBlock, keyPEMBlock = pem.Decode(keyPEMBlock)
+		if keyDERBlock == nil {
+			if len(skippedBlockTypes) == 0 {
+				return fail(errors.New("tls: failed to find any PEM data in key input"))
+			}
+			if len(skippedBlockTypes) == 1 && skippedBlockTypes[0] == "CERTIFICATE" {
+				return fail(errors.New("tls: found a certificate rather than a key in the PEM for the private key"))
+			}
+			return fail(fmt.Errorf("tls: failed to find PEM block with type ending in \"PRIVATE KEY\" in key input after skipping PEM blocks of the following types: %v", skippedBlockTypes))
+		}
+		if keyDERBlock.Type == "PRIVATE KEY" || strings.HasSuffix(keyDERBlock.Type, " PRIVATE KEY") {
+			break
+		}
+		skippedBlockTypes = append(skippedBlockTypes, keyDERBlock.Type)
 	}
 
-	return gnet.None
+	// We don't need to parse the public key for TLS, but we so do anyway
+	// to check that it looks sane and matches the private key.
+	x509Cert, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		return fail(err)
+	}
+
+	cert.PrivateKey, err = parsePrivateKey(keyDERBlock.Bytes)
+	if err != nil {
+		return fail(err)
+	}
+
+	switch pub := x509Cert.PublicKey.(type) {
+	case *rsa.PublicKey:
+		priv, ok := cert.PrivateKey.(*rsa.PrivateKey)
+		if !ok {
+			return fail(errors.New("tls: private key type does not match public key type"))
+		}
+		if pub.N.Cmp(priv.N) != 0 {
+			return fail(errors.New("tls: private key does not match public key"))
+		}
+	case *ecdsa.PublicKey:
+		priv, ok := cert.PrivateKey.(*ecdsa.PrivateKey)
+		if !ok {
+			return fail(errors.New("tls: private key type does not match public key type"))
+		}
+		if pub.X.Cmp(priv.X) != 0 || pub.Y.Cmp(priv.Y) != 0 {
+			return fail(errors.New("tls: private key does not match public key"))
+		}
+	case ed25519.PublicKey:
+		priv, ok := cert.PrivateKey.(ed25519.PrivateKey)
+		if !ok {
+			return fail(errors.New("tls: private key type does not match public key type"))
+		}
+		if !bytes.Equal(priv.Public().(ed25519.PublicKey), pub) {
+			return fail(errors.New("tls: private key does not match public key"))
+		}
+	default:
+		return fail(errors.New("tls: unknown public key algorithm"))
+	}
+
+	return cert, nil
+}
+
+// Attempt to parse the given private key DER block. OpenSSL 0.9.8 generates
+// PKCS #1 private keys by default, while OpenSSL 1.0.0 generates PKCS #8 keys.
+// OpenSSL ecparam generates SEC1 EC private keys for ECDSA. We try all three.
+func parsePrivateKey(der []byte) (crypto.PrivateKey, error) {
+	if key, err := x509.ParsePKCS1PrivateKey(der); err == nil {
+		return key, nil
+	}
+	if key, err := x509.ParsePKCS8PrivateKey(der); err == nil {
+		switch key := key.(type) {
+		case *rsa.PrivateKey, *ecdsa.PrivateKey, ed25519.PrivateKey:
+			return key, nil
+		default:
+			return nil, errors.New("tls: found unknown private key type in PKCS#8 wrapping")
+		}
+	}
+	if key, err := x509.ParseECPrivateKey(der); err == nil {
+		return key, nil
+	}
+
+	return nil, errors.New("tls: failed to parse private key")
 }
